@@ -1,8 +1,3 @@
-/*
- * admission.c — versão final, compilável, integrada
- * Para a defesa intermédia de SO (2025–2026)
- */
-
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -23,11 +18,17 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdint.h>
 
-#define LOG_FILE "log.txt"
 #define MESSAGE_QUEUE_KEY 1234
 #define MAX_NAME_LEN 50
 #define MAX_PRIORITY 5
+#define INPUT_PIPE "/tmp/input_pipe"
+#define BUF_SIZE 1024
+#define LOG_FILE "DEI_Emergency.log"
+#define LOG_MMAP_SIZE (10 * 1024 * 1024)  // 10 MB
 
 /* ======================== STRUCTS ======================== */
 typedef struct settings {
@@ -53,9 +54,9 @@ typedef struct msgbuf {
 
 /* ======================== GLOBALS EXISTENTES ======================== */
 
-settings global_settings;              // <-- ESTA é a versão correta (única)
+int input_fd = -1;                // ficheiro de input
+settings global_settings;              
 
-sem_t *log_sem;                 // semáforo para o log
 FILE *logfd;                    // ficheiro de log
 
 int message_queue_id;           // message queue
@@ -70,6 +71,13 @@ admission_data *admission_array;
 sem_t doctor_sem;
 int doctor_shm_id;
 int *doctor_array;
+
+/* MMF globals */
+static int log_fd = -1;
+static void *log_map = NULL;       // pointer para o mmf
+static size_t log_map_size = LOG_MMAP_SIZE;
+static const char *LOG_SEM_NAME = "/dei_log_sem";
+static sem_t *log_sem = NULL;      // agora usa sem_open
 
 /* ======================= TRIAGE QUEUE ======================== */
 
@@ -88,27 +96,6 @@ pthread_t *triage_threads;
 /* ============================================================= */
 /* ==================== FUNÇÕES EXISTENTES ===================== */
 /* ============================================================= */
-
-int write_to_log(char *log_info) {
-    sem_wait(log_sem);
-    logfd = fopen(LOG_FILE, "a");
-    if (!logfd) {
-        sem_post(log_sem);
-        return 1;
-    }
-
-    time_t now = time(NULL);
-    struct tm *tm = localtime(&now);
-    char ts[80];
-    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
-
-    fprintf(logfd, "%s %s\n", ts, log_info);
-    printf("%s %s\n", ts, log_info);
-
-    fclose(logfd);
-    sem_post(log_sem);
-    return 0;
-}
 
 int read_configfile(char *config_file) {
     FILE *f = fopen(config_file, "r");
@@ -129,11 +116,26 @@ int read_configfile(char *config_file) {
 }
 
 int validate_settings() {
-    if (global_settings.max_queue_size <= 0) return 1;
-    if (global_settings.num_screening_threads <= 0) return 1;
-    if (global_settings.num_doctor_processes <= 0) return 1;
-    if (global_settings.shift_length < 0) return 1;
-    if (global_settings.msg_wait_max <= 0) return 1;
+    if (global_settings.max_queue_size <= 0) {
+        fprintf(stderr, "[ERROR_CONFIG]: {MAX_QUEUE_SIZE} must be >= 1\n");
+            return 1;
+    }
+    if (global_settings.num_screening_threads <= 0) {
+        fprintf(stderr, "[ERROR_CONFIG]: {NUM_SCREENING_THREADS} must be >= 1\n");
+        return 1;
+    }
+    if (global_settings.num_doctor_processes <= 0) {
+        fprintf(stderr, "[ERROR_CONFIG]: {NUM_DOCTOR_PROCESSES} must be >= 1\n");
+        return 1;
+    }
+    if (global_settings.shift_length < 0) {
+        fprintf(stderr, "[ERROR_CONFIG]: {SHIFT_LENGTH} must be >= 0\n");
+        return 1;
+    }
+    if (global_settings.msg_wait_max <= 0) {
+        fprintf(stderr, "[ERROR_CONFIG]: {MSG_WAIT_MAX} must be >= 1\n");
+        return 1;
+    }
     return 0;
 }
 
@@ -172,6 +174,139 @@ int create_doctor_shm() {
 
     return 0;
 }
+
+int init_log_mmf() {
+    // abre/cria ficheiro
+    log_fd = open(LOG_FILE, O_RDWR | O_CREAT, 0600);
+    if (log_fd < 0) {
+        perror("open log file");
+        return 1;
+    }
+
+    // garante tamanho
+    if (ftruncate(log_fd, log_map_size) < 0) {
+        perror("ftruncate log file");
+        close(log_fd);
+        return 1;
+    }
+
+    // mapa em memória partilhada (MAP_SHARED para partilhar com forks)
+    log_map = mmap(NULL, log_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, log_fd, 0);
+    if (log_map == MAP_FAILED) {
+        perror("mmap log file");
+        close(log_fd);
+        log_map = NULL;
+        return 1;
+    }
+
+    // criar/open do semaphore nomeado (pshared across processes)
+    // remove sem antigo se existir (não faz mal se não existir)
+    sem_unlink(LOG_SEM_NAME);
+    log_sem = sem_open(LOG_SEM_NAME, O_CREAT | O_EXCL, 0600, 1);
+    if (log_sem == SEM_FAILED) {
+        // se já existir, tenta abrir
+        log_sem = sem_open(LOG_SEM_NAME, 0);
+        if (log_sem == SEM_FAILED) {
+            perror("sem_open");
+            munmap(log_map, log_map_size);
+            close(log_fd);
+            log_map = NULL;
+            return 1;
+        }
+    }
+
+    // inicializa offset a 0 se estiver a começar (só a primeira criação deve escrever)
+    // sincroniza para garantir que apenas o creator inicializa
+    sem_wait(log_sem);
+    uint64_t *offptr = (uint64_t *)log_map;
+    if (*offptr == 0) {
+        // se for zero, assume-se vazio -> escreve cabeçalho inicial (pode estar a zeros)
+        *offptr = 0;
+    }
+    sem_post(log_sem);
+
+    return 0;
+}
+
+int append_log_mmf(const char *fmt, ...) {
+    if (!log_map || !log_sem) return 1;
+
+    // preparar mensagem com timestamp
+    char msg[1024];
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char ts[64];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+
+    va_list ap;
+    va_start(ap, fmt);
+    char body[900];
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+
+    snprintf(msg, sizeof(msg), "%s %s\n", ts, body);
+    size_t msglen = strlen(msg);
+
+    // sincroniza entre processos
+    sem_wait(log_sem);
+
+    uint64_t *offptr = (uint64_t *)log_map;
+    uint64_t offset = *offptr; // offset relativo a log_map + 8
+
+    // localização de escrita
+    size_t header = sizeof(uint64_t);
+    if (header + offset + msglen >= log_map_size) {
+        // sem espaço suficiente: comportamento possível -> truncar, ou rolar, ou rejeitar.
+        // Aqui: escrevemos uma mensagem de aviso no próprio log e fechamos (evita overflow).
+        const char *err = "LOG MMF FULL: cannot append message\n";
+        size_t errlen = strlen(err);
+        if (header + offset + errlen < log_map_size) {
+            memcpy((char *)log_map + header + offset, err, errlen);
+            *offptr = offset + errlen;
+            msync(log_map, log_map_size, MS_SYNC);
+        }
+        sem_post(log_sem);
+        return 1;
+    }
+
+    memcpy((char *)log_map + header + offset, msg, msglen);
+    offset += msglen;
+    *offptr = offset;
+
+    // força escrita no disco (durability). Podes omitir msync por performance, caso aceites risco.
+    msync(log_map, log_map_size, MS_SYNC);
+
+    sem_post(log_sem);
+
+    // também imprime no stdout, como exige o enunciado
+    printf("%s", msg);
+
+    return 0;
+}
+
+int write_to_log(char *log_info) {
+    append_log_mmf("%s", log_info);
+    return 0;   
+}
+
+void close_log_mmf() {
+    if (log_map) {
+        msync(log_map, log_map_size, MS_SYNC);
+        munmap(log_map, log_map_size);
+        log_map = NULL;
+    }
+    if (log_fd >= 0) {
+        close(log_fd);
+        log_fd = -1;
+    }
+    if (log_sem) {
+        sem_close(log_sem);
+        sem_unlink(LOG_SEM_NAME);
+        log_sem = NULL;
+    }
+}
+
+
 
 /* ============================================================= */
 /* ============== TRIAGE QUEUE (threads) ======================== */
@@ -228,6 +363,123 @@ int triage_pop(triage_queue_t *q, admission_data *out) {
     pthread_mutex_unlock(&q->mutex);
     return 0;
 }
+
+int create_and_open_input_pipe() {
+    // cria o named pipe se não existir
+    if ((mkfifo(INPUT_PIPE, 0600) < 0) && (errno != EEXIST)) {
+        write_to_log("[ERROR] Could not create input_pipe");
+        return 1;
+    }
+
+    // abre o pipe em modo leitura/escrita
+    // O_RDWR evita que open() bloqueie quando ainda não há writers
+    input_fd = open(INPUT_PIPE, O_RDWR);
+    if (input_fd < 0) {
+        write_to_log("[ERROR] Could not open input_pipe");
+        return 1;
+    }
+
+    write_to_log("input_pipe created and opened successfully");
+    return 0;
+}
+
+int read_line_from_pipe(char *buffer, size_t size) {
+    ssize_t n = read(input_fd, buffer, size - 1);
+
+    if (n <= 0) {
+        return 0; // pipe vazio ou EOF
+    }
+
+    buffer[n] = '\0';
+
+    // remover newline se existir
+    char *nl = strchr(buffer, '\n');
+    if (nl) *nl = '\0';
+
+    return 1;
+}
+
+int line_is_triage_command(char *line) {
+    return strncmp(line, "TRIAGE=", 7) == 0;
+}
+
+int line_is_group(char *line) {
+    // grupo começa com número inteiro
+    return isdigit(line[0]);
+}
+
+int parse_single_patient(char *line, admission_data *p) {
+    char name[MAX_NAME_LEN];
+    int stime, atime, prio;
+
+    if (sscanf(line, "%s %d %d %d", name, &stime, &atime, &prio) != 4) {
+        write_to_log("[ERROR] Invalid patient format");
+        return 0;
+    }
+
+    static int next_id = 1;
+
+    p->patient_id = next_id++;
+    strncpy(p->name, name, MAX_NAME_LEN);
+    p->screening_time = stime;
+    p->service_time = atime;
+    p->priority = prio;
+
+    return 1;
+}
+
+void apply_triage_change(char *line) {
+    int new_value = atoi(line + 7);
+
+    if (new_value <= 0) {
+        write_to_log("[ERROR] Invalid TRIAGE value");
+        return;
+    }
+
+    char buf[128];
+    sprintf(buf, "Received TRIAGE=%d command", new_value);
+    write_to_log(buf);
+
+    // FUTURO: aqui iremos recriar threads (podes deixar assim por agora)
+    global_settings.num_screening_threads = new_value;
+}
+
+int parse_group(char *line, int *count, int *stime, int *atime, int *prio) {
+    if (sscanf(line, "%d %d %d %d", count, stime, atime, prio) != 4) {
+        return 0;
+    }
+    return 1;
+}
+
+void generate_auto_name(char *dest, int index) {
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+
+    sprintf(dest, "%04d-%02d-%02d-%03d",
+        tm->tm_year + 1900,
+        tm->tm_mon + 1,
+        tm->tm_mday,
+        index);
+}
+
+void create_group_patients(int count, int stime, int atime, int prio) {
+    for (int i = 1; i <= count; i++) {
+        admission_data p;
+
+        static int next_id = 1;
+        p.patient_id = next_id++;
+
+        generate_auto_name(p.name, i);
+        p.screening_time = stime;
+        p.service_time = atime;
+        p.priority = prio;
+
+        if (triage_push(&triage_q, &p) != 0) {
+            write_to_log("[ERROR] triage queue full — discarding grouped patient");
+        }
+    }
+}
+
 
 /* ===================== TRIAGE THREAD ===================== */
 void *triage_thread(void *arg) {
@@ -348,7 +600,14 @@ void cleanup(pid_t *pids) {
     shmdt(doctor_array);
     shmctl(doctor_shm_id, IPC_RMID, NULL);
 
+    if (input_fd >= 0) {
+        close(input_fd);
+    }
+    unlink(INPUT_PIPE);
+
+
     write_to_log("Cleanup complete.");
+    close_log_mmf();
 }
 
 /* ========================= MAIN ========================= */
@@ -363,6 +622,11 @@ int main(int argc, char **argv) {
     log_sem = malloc(sizeof(sem_t));
     sem_init(log_sem, 1, 1);
 
+    if (init_log_mmf() != 0) {
+        fprintf(stderr, "Failed to initialize log mmf\n");
+        return 1;
+    }
+
     if (read_configfile(argv[1]) != 0) {
         printf("Config read failed\n");
         return 1;
@@ -375,6 +639,11 @@ int main(int argc, char **argv) {
 
     create_admission_shm();
     create_doctor_shm();
+
+    if (create_and_open_input_pipe() != 0) {
+        printf("Failed to initialize input pipe\n");
+        return 1;
+    }
 
     /* sinais */
     signal(SIGINT, sigint_handler);
@@ -403,6 +672,7 @@ int main(int argc, char **argv) {
         pid_t pid = fork();
         if (pid == 0)
             doctor_process(i);
+            
         pids[i] = pid;
     }
 
@@ -420,9 +690,37 @@ int main(int argc, char **argv) {
         triage_push(&triage_q, &p);
     }
 
-    /* aguarda CTRL+C */
-    while (running)
-        pause();
+    char buf[BUF_SIZE];
+    
+    while (running) {
+        if (!read_line_from_pipe(buf, sizeof(buf)))
+        continue;
+
+        if (line_is_triage_command(buf)) {
+            apply_triage_change(buf);
+            continue;
+        }
+
+        if (line_is_group(buf)) {
+            int count, stime, atime, prio;
+            if (parse_group(buf, &count, &stime, &atime, &prio)) {
+                create_group_patients(count, stime, atime, prio);
+                continue;
+            }
+        }
+
+        // caso contrário → paciente normal
+        admission_data p;
+
+        if (!parse_single_patient(buf, &p))
+            continue;
+
+        triage_push(&triage_q, &p);
+
+        char logbuf[128];
+        sprintf(logbuf, "Received patient %s from pipe", p.name);
+        write_to_log(logbuf);
+    }
 
     /* termina */
     for (int i = 0; i < global_settings.num_screening_threads; i++)
@@ -432,4 +730,5 @@ int main(int argc, char **argv) {
 
     return 0;
 }
+
 
