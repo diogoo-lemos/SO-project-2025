@@ -1,6 +1,3 @@
-# SO-project-2025
-
-
 # Arquitetura do Sistema Urgências@DEI
 **Sistemas Operativos 2025/2026**
 
