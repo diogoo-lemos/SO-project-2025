@@ -1,0 +1,14 @@
+# Número máximo de posições na fila a aguardar triagem
+TRIAGE_QUEUE_MAX = 10
+
+# Número de threads na triagem
+TRIAGE = 5
+
+# Número de processos doutor
+DOCTORS = 10
+
+# Duração do turno em segundos
+SHIFT_LENGTH = 5
+
+# Tamanho máximo da fila para atendimento
+MSQ_WAIT_MAX = 20
